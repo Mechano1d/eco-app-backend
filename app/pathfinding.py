@@ -16,7 +16,5 @@ class pathfinding:
 
     def pathfind(self, start, finish):
         G = self.analyzer.graph
-        # all_nodes = self.analyzer.nodes.index.tolist()
-        # start, finish = random.sample(all_nodes, 2)
         path = nx.shortest_path(G, source=start, target=finish, weight=self.get_weight)
         return path
