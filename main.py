@@ -1,22 +1,18 @@
 import base64
 from io import BytesIO
-
 import osmnx as ox
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 import requests
 import time
-
 from pydantic import BaseModel
 from scipy.stats import pearsonr
 import folium
 from sqlalchemy import create_engine, URL
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
-
 import app.data_collector as data_collector
 import app.data_analyzer as data_analyzer
-from app.models import City, Node, PollutionData
 from app.pathfinding import pathfinding
 from folium.plugins import HeatMap
 import random
@@ -57,7 +53,7 @@ class RouteRequest(BaseModel):
     end: Tuple[float, float]
 
 class TransportEcoAnalysis:
-    def __init__(self, city_name, openweather_api_key=None, waqi_api_key=None, db=None):
+    def __init__(self, city_name, openweather_api_key="73883df466fd45fd40e89c4da87d1d65", waqi_api_key=None, db=None):
         """
         Ініціалізація системи аналізу впливу транспорту на екологію
 
@@ -74,6 +70,8 @@ class TransportEcoAnalysis:
         self.openweather_api_key = openweather_api_key
         self.waqi_api_key = waqi_api_key
         self.db = db
+        self.engine = engine
+        self.traffic_api_key = "1hscno43lFy01NDffAXrTFOWL7NSXSb2"
         self.graph = None
         self.nodes = None
         self.edges = None
@@ -91,7 +89,7 @@ class TransportEcoAnalysis:
         plt.tight_layout()
         plt.show()
 
-    def sample_nodes(self, n=20):
+    def sample_nodes(self, n=200):
         """Вибір випадкових точок з графа для аналізу"""
         if self.nodes is None:
             print("Спочатку завантажте граф міста за допомогою get_city_graph()")
@@ -161,33 +159,6 @@ class TransportEcoAnalysis:
 
         return map_folium
 
-def visualize_route(AnalysisApp, route: list, heatmap=None):
-    """
-    Створює інтерактивну мапу з відображенням маршруту
-    """
-    if not route or len(route) < 2:
-        raise ValueError("Маршрут занадто короткий або порожній")
-
-    if heatmap == None:
-        # Центр мапи — перша точка маршруту
-        start_node = route[0]
-        start_geom = AnalysisApp.nodes.loc[start_node].geometry
-        folium_map = folium.Map(location=[start_geom.y, start_geom.x], zoom_start=13)
-    else:
-        folium_map = heatmap
-
-    # Додати маршрут як лінію
-    latlons = [(AnalysisApp.nodes.loc[node].geometry.y,
-                AnalysisApp.nodes.loc[node].geometry.x) for node in route]
-
-    folium.PolyLine(latlons, color='blue', weight=5, opacity=0.8).add_to(folium_map)
-
-    # Позначити старт і фініш
-    folium.Marker(latlons[0], tooltip="Start", icon=folium.Icon(color="green")).add_to(folium_map)
-    folium.Marker(latlons[-1], tooltip="End", icon=folium.Icon(color="red")).add_to(folium_map)
-
-    return folium_map
-
 # Створюємо екземпляр FastAPI
 app = FastAPI(
     title="Система аналізу впливу транспорту на екологію",
@@ -247,6 +218,8 @@ async def root():
     </html>
     """
 
+# Основні методи
+
 
 @app.get("/cities/{city_name}/initialize")
 async def initialize_city(
@@ -298,6 +271,9 @@ async def collect_data(
 
         if num_points == -1:
             num_points = len(AnalysisApp.nodes)
+
+
+
         # Збираємо дані про забруднення
         data_collector.collect_pollution_data(AnalysisApp, num_points=num_points)
 
@@ -307,31 +283,16 @@ async def collect_data(
         # Зберігаємо аналізатор у глобальний словник
         analyzers[city_name] = AnalysisApp
 
+        # Конветрація типів numpy
+        pollution_data_clean = AnalysisApp.pollution_data.astype(object).where(pd.notnull(AnalysisApp.pollution_data), None)
+
         return {
             "status": "success",
             "message": f"Зібрано дані з {len(AnalysisApp.pollution_data)} точок даних для міста {city_name}",
-            "analyzed_points": len(AnalysisApp.pollution_data)
+            "analyzed_points": len(AnalysisApp.pollution_data),
+            "data": pollution_data_clean
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/cities/{city_name}/map", response_class=HTMLResponse)
-async def get_city_map(city_name: str):
-    """
-    Отримання інтерактивної карти забруднення для міста
-    """
-    if city_name not in analyzers:
-        raise HTTPException(status_code=404, detail=f"Місто {city_name} не ініціалізовано")
-    AnalysisApp = analyzers[city_name]
-    try:
-        # Отримуємо HTML-код карти
-        pollution_map = AnalysisApp.create_pollution_map()
-        if pollution_map:
-            return pollution_map.get_root().render()
-        else:
-            raise HTTPException(status_code=500, detail="Не вдалося створити карту забруднення")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -355,6 +316,135 @@ async def get_city_pollution(city_name: str):
             for item in pollution_data
         ]
         return JSONResponse(content=clean_data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/cities/{city_name}/route")
+async def calculate_route(city_name: str, data: RouteRequest):
+    if city_name not in analyzers:
+        raise HTTPException(status_code=404, detail=f"Місто {city_name} не ініціалізовано")
+
+    AnalysisApp = analyzers[city_name]
+    pathfinder = pathfinding(AnalysisApp)
+    print(f"data:{data.start}")
+    print(f"data:{data.end}")
+    start = ox.nearest_nodes(AnalysisApp.graph, data.start[1], data.start[0])
+    end = ox.nearest_nodes(AnalysisApp.graph, data.end[1], data.end[0])
+    print(f"start:{start}")
+    print(f"end:{end}")
+    try:
+        route = pathfinder.pathfind(start, end)
+        latlons = [(AnalysisApp.nodes.loc[node].geometry.y,
+                    AnalysisApp.nodes.loc[node].geometry.x) for node in route]
+        print(route)
+        return latlons
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/cities/{city_name}/full_analysis", response_model=Dict[str, Any])
+async def full_analysis(city_name: str):
+    """
+    Повний аналіз впливу транспорту на екологію:
+    кореляція, регресія, кластеризація, гарячі точки, розподіл AQI
+    """
+    if city_name not in analyzers:
+        raise HTTPException(status_code=404, detail=f"Місто {city_name} не ініціалізовано")
+
+    AnalysisApp = analyzers[city_name]
+
+    try:
+
+
+
+        # Гарячі точки
+        hotspots = []
+        if 'ow_aqi' in AnalysisApp.pollution_data.columns:
+            top = AnalysisApp.pollution_data.sort_values('ow_aqi', ascending=False).head(3)
+            source = "OpenWeatherMap"
+            aqi_col = 'ow_aqi'
+        elif 'waqi_aqi' in AnalysisApp.pollution_data.columns:
+            top = AnalysisApp.pollution_data.sort_values('waqi_aqi', ascending=False).head(3)
+            source = "WAQI"
+            aqi_col = 'waqi_aqi'
+        else:
+            top = []
+            aqi_col = None
+            source = ""
+
+        for _, row in top.iterrows():
+            hotspots.append({
+                "latitude": float(row["latitude"]),
+                "longitude": float(row["longitude"]),
+                "aqi": float(row[aqi_col]),
+                "source": source
+            })
+
+        # Кластеризація
+        cluster_data = data_analyzer.analyze_clusters(self=AnalysisApp, n_clusters=5)
+
+        # Кореляції
+        correlation_results = data_analyzer.analyze_correlations(AnalysisApp)
+
+        # Регресійні моделі
+        regressions = data_analyzer.analyze_regressions(AnalysisApp)
+
+        # Розподіл AQI
+        aqi_distribution = data_analyzer.aqi_distribution(AnalysisApp)
+
+        co_distribution = data_analyzer.param_distribution(AnalysisApp, "ow_co")
+
+        no2_distribution = data_analyzer.param_distribution(AnalysisApp, "ow_no2")
+
+        pm_2_5_distribution = data_analyzer.param_distribution(AnalysisApp, "ow_pm2_5")
+
+        pm_10_distribution = data_analyzer.param_distribution(AnalysisApp, "ow_pm10")
+
+        # Підсумок
+        analysis_results = {
+            "city_name": city_name,
+            "analyzed_points": len(AnalysisApp.pollution_data),
+            "correlations": correlation_results,
+            "regression_models": regressions,
+            "clusters": cluster_data["points"],
+            "cluster_summary": cluster_data["cluster_summary"],
+            "aqi_distribution": aqi_distribution,
+            "co_distribution": co_distribution,
+            "no2_distribution": no2_distribution,
+            "pm_2_5_distribution": pm_2_5_distribution,
+            "pm_10_distribution": pm_10_distribution,
+            "hotspots": hotspots,
+            "recommendations": [
+                "Моніторинг забруднення у виявлених гарячих точках",
+                "Регулювання транспортних потоків у районах з високим рівнем забруднення",
+                "Розгляд можливості створення зон з низьким рівнем викидів"
+            ]
+        }
+
+        return analysis_results
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Додаткові методи
+
+
+@app.get("/cities/{city_name}/map", response_class=HTMLResponse)
+async def get_city_map(city_name: str):
+    """
+    Отримання інтерактивної карти забруднення для міста
+    """
+    if city_name not in analyzers:
+        raise HTTPException(status_code=404, detail=f"Місто {city_name} не ініціалізовано")
+    AnalysisApp = analyzers[city_name]
+    try:
+        # Отримуємо HTML-код карти
+        pollution_map = AnalysisApp.create_pollution_map()
+        if pollution_map:
+            return pollution_map.get_root().render()
+        else:
+            raise HTTPException(status_code=500, detail="Не вдалося створити карту забруднення")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -400,213 +490,6 @@ async def get_city_graph(city_name: str):
             raise HTTPException(status_code=500, detail="Не вдалося створити візуалізацію графа")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/cities/{city_name}/analyze")
-async def analyze_city(city_name: str):
-    """
-    Отримання результатів аналізу впливу транспорту на екологію міста
-    """
-    if city_name not in analyzers:
-        raise HTTPException(status_code=404, detail=f"Місто {city_name} не ініціалізовано")
-    AnalysisApp = analyzers[city_name]
-    try:
-        # Виконуємо кореляційний аналіз
-        correlation_results = data_analyzer.generate_report(AnalysisApp)
-
-        # Перетворюємо результати кореляції в читабельний формат
-        formatted_correlations = {}
-        print("Correlation results:")
-        print(correlation_results)
-        for metric, data in correlation_results.items():
-            if data is not None and "correlation" in data and "p_value" in data:
-                formatted_correlations[metric] = {
-                    "correlation": float(data["correlation"]),
-                    "p_value": float(data["p_value"]),
-                    "significance": "значуща" if data["p_value"] < 0.05 else "не значуща"
-                }
-            else:
-                formatted_correlations[metric] = {
-                    "correlation": None,
-                    "p_value": None,
-                    "significance": "н/д"
-                }
-
-        # Виявляємо "гарячі точки" забруднення
-        hotspots = []
-
-        if 'ow_aqi' in AnalysisApp.pollution_data.columns:
-            sorted_data = AnalysisApp.pollution_data.sort_values('ow_aqi', ascending=False).head(3)
-            for _, row in sorted_data.iterrows():
-                hotspots.append({
-                    "latitude": float(row['latitude']),
-                    "longitude": float(row['longitude']),
-                    "aqi": float(row['ow_aqi']),
-                    "source": "OpenWeatherMap"
-                })
-        elif 'waqi_aqi' in AnalysisApp.pollution_data.columns:
-            sorted_data = AnalysisApp.pollution_data.sort_values('waqi_aqi', ascending=False).head(3)
-            for _, row in sorted_data.iterrows():
-                hotspots.append({
-                    "latitude": float(row['latitude']),
-                    "longitude": float(row['longitude']),
-                    "aqi": float(row['waqi_aqi']),
-                    "source": "WAQI"
-                })
-
-        # Формуємо результати аналізу
-        analysis_results = {
-            "city_name": city_name,
-            "analyzed_points": len(AnalysisApp.pollution_data),
-            "correlations": correlation_results,
-            "hotspots": hotspots,
-            "recommendations": [
-                "Моніторинг забруднення у виявлених гарячих точках",
-                "Регулювання транспортних потоків у районах з високим рівнем забруднення",
-                "Розгляд можливості створення зон з низьким рівнем викидів"
-            ]
-        }
-        result = data_analyzer.generate_report(AnalysisApp)
-        regression_result = result.get("regression", None)
-
-        if regression_result:
-            analysis_results["regression"] = {
-                "equation": regression_result["equation"],
-                "r_squared": regression_result["r_squared"],
-                "target": regression_result["target"]
-            }
-
-        return analysis_results
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# @app.get("/cities/{city_name}/route")
-# async def find_route(
-#         city_name: str,
-#         start: Optional[int] = Query(None, description="API ключ для OpenWeatherMap"),
-#         end: Optional[int] = Query(None, description="API ключ для OpenWeatherMap")
-# ):
-#     if city_name not in analyzers:
-#         raise HTTPException(status_code=404, detail=f"Місто {city_name} не ініціалізовано")
-#     AnalysisApp = analyzers[city_name]
-#     pathfinder = pathfinding(AnalysisApp)
-#     try:
-#         route = pathfinder.pathfind(start, end)
-#         return route
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/cities/{city_name}/route/visual", response_class=HTMLResponse)
-async def visualize_route_api(city_name: str, data: RouteRequest):
-    if city_name not in analyzers:
-        raise HTTPException(status_code=404, detail=f"Місто {city_name} не ініціалізовано")
-
-    AnalysisApp = analyzers[city_name]
-    pathfinder = pathfinding(AnalysisApp)
-    heatmap = AnalysisApp.create_pollution_map()
-    start = ox.nearest_nodes(AnalysisApp.graph, data.start[0], data.start[1])
-    end = ox.nearest_nodes(AnalysisApp.graph, data.end[0], data.end[1])
-    try:
-        result = pathfinder.pathfind(start, end)
-        fmap = visualize_route(AnalysisApp, result, heatmap)
-        return fmap.get_root().render()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/cities/{city_name}/route")
-async def calculate_route(city_name: str, data: RouteRequest):
-    if city_name not in analyzers:
-        raise HTTPException(status_code=404, detail=f"Місто {city_name} не ініціалізовано")
-
-    AnalysisApp = analyzers[city_name]
-    pathfinder = pathfinding(AnalysisApp)
-    print(f"data:{data.start}")
-    print(f"data:{data.end}")
-    start = ox.nearest_nodes(AnalysisApp.graph, data.start[1], data.start[0])
-    end = ox.nearest_nodes(AnalysisApp.graph, data.end[1], data.end[0])
-    print(f"start:{start}")
-    print(f"end:{end}")
-    try:
-        route = pathfinder.pathfind(start, end)
-        latlons = [(AnalysisApp.nodes.loc[node].geometry.y,
-                    AnalysisApp.nodes.loc[node].geometry.x) for node in route]
-        print(route)
-        return latlons
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/cities/{city_name}/full_analysis", response_model=Dict[str, Any])
-async def full_analysis(city_name: str):
-    """
-    Повний аналіз впливу транспорту на екологію:
-    кореляція, регресія, кластеризація, гарячі точки, розподіл AQI
-    """
-    if city_name not in analyzers:
-        raise HTTPException(status_code=404, detail=f"Місто {city_name} не ініціалізовано")
-
-    AnalysisApp = analyzers[city_name]
-
-    try:
-        # Основний звіт з кореляцією
-        correlation_results = data_analyzer.generate_report(AnalysisApp)
-
-
-        # Гарячі точки
-        hotspots = []
-        if 'ow_aqi' in AnalysisApp.pollution_data.columns:
-            top = AnalysisApp.pollution_data.sort_values('ow_aqi', ascending=False).head(3)
-            source = "OpenWeatherMap"
-            aqi_col = 'ow_aqi'
-        elif 'waqi_aqi' in AnalysisApp.pollution_data.columns:
-            top = AnalysisApp.pollution_data.sort_values('waqi_aqi', ascending=False).head(3)
-            source = "WAQI"
-            aqi_col = 'waqi_aqi'
-        else:
-            top = []
-            aqi_col = None
-            source = ""
-
-        for _, row in top.iterrows():
-            hotspots.append({
-                "latitude": float(row["latitude"]),
-                "longitude": float(row["longitude"]),
-                "aqi": float(row[aqi_col]),
-                "source": source
-            })
-
-        # Кластеризація
-        clusters = data_analyzer.analyze_clusters(AnalysisApp)
-
-        # Регресійні моделі
-        regressions = data_analyzer.analyze_regression(AnalysisApp)
-
-        # Розподіл AQI
-        aqi_distribution = data_analyzer.aqi_distribution(AnalysisApp)
-
-        # Підсумок
-        analysis_results = {
-            "city_name": city_name,
-            "analyzed_points": len(AnalysisApp.pollution_data),
-            "correlations": correlation_results,
-            "regression_models": regressions,
-            "clusters": clusters,
-            "aqi_distribution": aqi_distribution,
-            "hotspots": hotspots,
-            "recommendations": [
-                "Моніторинг забруднення у виявлених гарячих точках",
-                "Регулювання транспортних потоків у районах з високим рівнем забруднення",
-                "Розгляд можливості створення зон з низьким рівнем викидів"
-            ]
-        }
-
-        return analysis_results
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 # Запуск застосунку при виконанні скрипта напряму
 if __name__ == "__main__":

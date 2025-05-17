@@ -1,5 +1,8 @@
 import time
+
+import numpy as np
 import pandas as pd
+import requests
 from scipy.stats import pearsonr
 from sklearn.cluster import KMeans
 from sklearn.linear_model import LinearRegression
@@ -15,71 +18,59 @@ def sample_nodes(self, n=20):
     sample_nodes = self.nodes.sample(min(n, len(self.nodes)))
     return sample_nodes
 
-def collect_pollution_data(self, num_points=20):
-    """Збір даних про забруднення для вибраних точок"""
-    print("Збір даних про забруднення повітря...")
-    if self.nodes is None:
-        print("Спочатку завантажте граф міста за допомогою get_city_graph()")
-        return
-
-    sample_nodes = self.sample_nodes(num_points)
-    pollution_data = []
-
-    for idx, node in sample_nodes.iterrows():
-        lat, lon = node.geometry.y, node.geometry.x
-        print(f"Обробка точки {lat}, {lon}")
-
-        # Отримуємо дані про забруднення з двох джерел
-        ow_data = self.get_openweather_pollution(lat, lon)
-        waqi_data = self.get_waqi_pollution(lat, lon)
-
-        # Об'єднуємо дані
-        node_data = {
-            'node_id': idx,
-            'latitude': lat,
-            'longitude': lon,
-            'road_count': len(self.graph.out_edges(idx))
-        }
-
-        if ow_data:
-            node_data.update({
-                'ow_aqi': ow_data['aqi'],
-                'ow_co': ow_data['co'],
-                'ow_no2': ow_data['no2'],
-                'ow_pm2_5': ow_data['pm2_5'],
-                'ow_pm10': ow_data['pm10']
-            })
-
-        if waqi_data:
-            node_data.update({
-                'waqi_aqi': waqi_data['aqi'],
-                'waqi_pm25': waqi_data['pm25'],
-                'waqi_pm10': waqi_data['pm10']
-            })
-
-        pollution_data.append(node_data)
-        print(node_data)
-        time.sleep(0.5)  # Пауза між запитами до API
-
-    self.pollution_data = pd.DataFrame(pollution_data)
-    print(f"Зібрано дані про забруднення для {len(self.pollution_data)} точок.")
-    return self.pollution_data
 
 def calculate_traffic_intensity(self):
-    """Розрахунок інтенсивності руху на основі структури дорожньої мережі"""
+    """Розрахунок інтенсивності руху та збереження/завантаження з БД"""
     if self.graph is None or self.pollution_data.empty:
         print("Спочатку завантажте граф міста та зберіть дані про забруднення")
         return
 
-    # Простий підхід: використовуємо кількість доріг, підключених до вузла,
-    # як проксі для інтенсивності руху
-    # У реальній системі тут можна інтегрувати дані про трафік
+    table_name = f"traffic_intensity_{self.city_name.lower().replace(' ', '_')}"
 
-    # Нормалізуємо показник дорожнього навантаження
-    max_road_count = self.pollution_data['road_count'].max()
-    self.pollution_data['traffic_intensity'] = self.pollution_data['road_count'] / max_road_count
+    try:
+        # Спроба завантажити з БД
+        query = f"SELECT node_id, traffic_intensity FROM {table_name}"
+        df_db = pd.read_sql(query, con=self.engine)
 
-    return self.pollution_data['traffic_intensity']
+        print(f"Інтенсивність трафіку завантажено з бази даних для {len(df_db)} вузлів.")
+
+        # Зливаємо з pollution_data
+        self.pollution_data = self.pollution_data.merge(
+            df_db, on='node_id', how='left'
+        )
+
+        return self.pollution_data['traffic_intensity']
+
+    except Exception as e:
+        print(f"Не вдалося завантажити з БД: {e}")
+        print("Обчислення інтенсивності трафіку на основі OSM...")
+
+        # Простий евристичний підхід: road_count + ваги типу дороги
+        node_scores = {}
+        for node in self.graph.nodes:
+            degree = len(list(self.graph.out_edges(node))) + len(list(self.graph.in_edges(node)))
+            types = [
+                self.graph.edges[u, v, k].get('highway', 'unclassified')
+                for u, v, k in self.graph.out_edges(node, keys=True)
+            ]
+            # Оцінюємо тип дороги (вага)
+            type_score = sum(_road_type_weight(t) for t in types) / max(1, len(types))
+            node_scores[node] = degree * type_score
+
+        # Нормалізація
+        max_score = max(node_scores.values())
+        for node_id in node_scores:
+            node_scores[node_id] /= max_score
+
+        # Запис у pollution_data
+        self.pollution_data['traffic_intensity'] = self.pollution_data['node_id'].map(node_scores)
+
+        # Формуємо DataFrame для БД
+        traffic_df = self.pollution_data[['node_id', 'traffic_intensity']].copy()
+        traffic_df.to_sql(table_name, con=self.engine, if_exists='replace', index=False)
+        print(f"Інтенсивність трафіку збережено в БД у таблицю {table_name}.")
+
+        return self.pollution_data['traffic_intensity']
 
 def linear_regression_analysis(self):
     """Лінійна регресія між трафіком і AQI"""
@@ -110,69 +101,65 @@ def linear_regression_analysis(self):
         "target": aqi_col
     }
 
-def analyze_correlation(self):
-    """Аналіз кореляції між інтенсивністю руху та забрудненням"""
+
+def analyze_correlations(self):
+    """
+    Обчислює кореляцію між трафіком та всіма показниками забруднення.
+    """
     if 'traffic_intensity' not in self.pollution_data.columns:
         self.calculate_traffic_intensity()
 
-    print("\n=== Аналіз кореляції між рухом та забрудненням ===")
+    pollution_cols = [col for col in self.pollution_data.columns if col.startswith("ow_") or col.startswith("waqi_")]
+    results = []
 
-    # Перевіряємо кореляцію з різними показниками забруднення
-    pollution_metrics = [col for col in self.pollution_data.columns
-                         if any(col.startswith(p) for p in ['ow_', 'waqi_'])]
+    for col in pollution_cols:
+        df = self.pollution_data[['traffic_intensity', col]].dropna()
+        if len(df) >= 3:
+            corr, p_value = pearsonr(df['traffic_intensity'], df[col])
+            results.append({
+                "parameter": col,
+                "correlation": round(corr, 3),
+                "p_value": round(p_value, 4),
+                "significant": bool(p_value < 0.05)
+            })
 
-    correlation_results = {}
-
-    for metric in pollution_metrics:
-        if self.pollution_data[metric].notnull().sum() > 2:  # Потрібно мінімум 3 точки для кореляції
-            corr, p_value = pearsonr(
-                self.pollution_data['traffic_intensity'],
-                self.pollution_data[metric]
-            )
-            correlation_results[metric] = {'correlation': corr, 'p_value': p_value}
-
-            significance = "статистично значуща" if p_value < 0.05 else "статистично не значуща"
-            print(f"{metric}: кореляція = {corr:.2f}, p-value = {p_value:.4f} ({significance})")
-
-    return correlation_results
-
-def analyze_clusters(self, n_clusters=3):
-    """Кластеризація точок забруднення"""
-    pollution_cols = [col for col in self.pollution_data.columns if 'aqi' in col]
-    if not pollution_cols:
-        return []
-
-    features = self.pollution_data[['latitude', 'longitude'] + pollution_cols].dropna()
-
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42).fit(features[pollution_cols])
-    features['cluster'] = kmeans.labels_
-
-    # Повертаємо список координат з їхніми кластерами
-    return features[['latitude', 'longitude', 'cluster']].to_dict(orient='records')
-
-def analyze_regression(self):
-    """Лінійна регресія для оцінки впливу трафіку на забруднення"""
-    if 'traffic_intensity' not in self.pollution_data.columns:
-        self.calculate_traffic_intensity()
-
-    results = {}
-    for col in self.pollution_data.columns:
-        if 'aqi' in col:
-            df = self.pollution_data[['traffic_intensity', col]].dropna()
-            if len(df) >= 3:
-                model = LinearRegression()
-                model.fit(df[['traffic_intensity']], df[col])
-                score = model.score(df[['traffic_intensity']], df[col])
-                results[col] = {
-                    'coefficient': float(model.coef_[0]),
-                    'intercept': float(model.intercept_),
-                    'r2_score': float(score)
-                }
     return results
+
+
+def analyze_regressions(self):
+    """
+    Лінійна регресія для всіх показників забруднення відносно traffic_intensity.
+    """
+    if 'traffic_intensity' not in self.pollution_data.columns:
+        self.calculate_traffic_intensity()
+
+    pollution_cols = [col for col in self.pollution_data.columns if col.startswith("ow_") or col.startswith("waqi_")]
+    results = []
+
+    for col in pollution_cols:
+        df = self.pollution_data[['traffic_intensity', col]].dropna()
+        if len(df) >= 3:
+            X = df[['traffic_intensity']]
+            y = df[col]
+
+            model = LinearRegression()
+            model.fit(X, y)
+
+            result = {
+                "parameter": col,
+                "intercept": round(model.intercept_, 3),
+                "coefficient": round(model.coef_[0], 3),
+                "r2_score": round(model.score(X, y), 3),
+                "equation": f"{col} = {model.intercept_:.2f} + {model.coef_[0]:.2f} * traffic_intensity"
+            }
+            results.append(result)
+    print(results)
+    return results
+
 
 def aqi_distribution(self):
     """Підрахунок кількості точок з кожним рівнем AQI (1-5)"""
-    distribution = {}
+    counts = None
     aqi_col = None
     if 'ow_aqi' in self.pollution_data.columns:
         aqi_col = 'ow_aqi'
@@ -180,11 +167,65 @@ def aqi_distribution(self):
         aqi_col = 'waqi_aqi'
 
     if aqi_col:
-        bins = [0, 50, 100, 150, 200, 500]
-        labels = [1, 2, 3, 4, 5]
-        self.pollution_data['aqi_level'] = pd.cut(self.pollution_data[aqi_col], bins=bins, labels=labels)
-        distribution = self.pollution_data['aqi_level'].value_counts().sort_index().to_dict()
-    return {int(k): int(v) for k, v in distribution.items()}
+        counts = self.pollution_data[aqi_col].value_counts().sort_index()
+        for category, count in counts.items():
+            print(f"Категорія {category}: {count} точок")
+    return {int(k): int(v) for k, v in counts.items()}
+
+
+def param_distribution(self, column: str, bins: int = 10):
+    """
+    Розподіл значень певного параметра (ow_co, ow_no2, ow_pm2_5, ow_pm10) по біннах.
+    :param column: назва колонки у pollution_data
+    :param bins: кількість бінів для гістограми
+    :return: словник {"<interval>": count}
+    """
+    print(self.pollution_data.columns)
+    if column not in self.pollution_data.columns:
+        return {}
+
+    values = self.pollution_data[column].dropna()
+    hist, bin_edges = np.histogram(values, bins=bins)
+
+    result = {}
+    for i in range(len(hist)):
+        interval = f"{bin_edges[i]:.2f}–{bin_edges[i+1]:.2f}"
+        result[interval] = int(hist[i])
+    return result
+
+
+def analyze_clusters(self, n_clusters=3):
+    """Кластеризація точок забруднення + статистика по кластерах"""
+    pollution_cols = [col for col in self.pollution_data.columns if 'aqi' in col or 'co' in col]
+    if not pollution_cols:
+        return {
+            "points": [],
+            "cluster_summary": []
+        }
+
+    features = self.pollution_data[['latitude', 'longitude'] + pollution_cols].dropna()
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42).fit(features[pollution_cols])
+    features['cluster'] = kmeans.labels_
+
+    # Зведена статистика по кожному кластеру
+    cluster_summary = (
+        features
+        .groupby("cluster")[pollution_cols]
+        .mean()
+        .round(2)
+        .reset_index()
+        .to_dict(orient="records")
+    )
+
+    # Список точок з координатами та кластером
+    points = features[['latitude', 'longitude', 'cluster']].to_dict(orient='records')
+
+    return {
+        "points": points,
+        "cluster_summary": cluster_summary
+    }
+
 
 def generate_report(self):
     """Генерація звіту про вплив транспорту на екологію"""
@@ -222,7 +263,7 @@ def generate_report(self):
             print(f"Категорія {category}: {count} точок")
 
     # Аналіз кореляції
-    analyze_correlation(self)
+    analyze_correlations(self)
 
     # Виявлення "гарячих точок" забруднення
     print("\n=== Гарячі точки забруднення ===")
@@ -237,10 +278,26 @@ def generate_report(self):
     print("2. Регулювання транспортних потоків у районах з високим рівнем забруднення.")
     print("3. Розгляд можливості створення зон з низьким рівнем викидів.")
 
-    correlation_results = analyze_correlation(self)
+    correlation_results = analyze_correlations(self)
     regression_result = linear_regression_analysis(self)
 
     return {
         "correlations": correlation_results,
         "regression": regression_result
     }
+
+def _road_type_weight(road_type):
+    """Вага типу дороги — чим більша, тим вища очікувана інтенсивність"""
+    weights = {
+        'motorway': 1.0,
+        'trunk': 0.9,
+        'primary': 0.8,
+        'secondary': 0.6,
+        'tertiary': 0.4,
+        'residential': 0.2,
+        'service': 0.1,
+        'unclassified': 0.05
+    }
+    if isinstance(road_type, list):
+        road_type = road_type[0]
+    return weights.get(road_type, 0.05)

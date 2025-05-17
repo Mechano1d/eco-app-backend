@@ -94,16 +94,18 @@ def get_city_graph(self, engine):
             return False
 
 
-def get_openweather_pollution(self, lat, lon):
-    """Отримання даних про забруднення з OpenWeatherMap API"""
+def get_openweather_pollution(self, lat, lon, road_count=1, highway_level=1):
+    """Отримання або генерація даних про забруднення з OpenWeatherMap API"""
     if not self.openweather_api_key:
-        # Генеруємо тестові дані для демонстрації
+        # Базовий коефіцієнт забруднення
+        intensity_factor = (road_count + 1) * (highway_level + 1)
+
         return {
-            'aqi': random.randint(1, 5),
-            'co': random.uniform(200, 2000),
-            'no2': random.uniform(10, 100),
-            'pm2_5': random.uniform(0, 50),
-            'pm10': random.uniform(0, 75)
+            'aqi': min(5, int(random.gauss(4, 1))),
+            'co': max(0.0, random.uniform(100, 200) * 0.4 + intensity_factor * random.uniform(100, 200) * 0.6),
+            'no2': max(0.0, random.uniform(30, 80) * 0.4 + intensity_factor * random.uniform(30, 80) * 0.6),
+            'pm2_5': max(0.0, random.uniform(20, 70) * 0.4 + intensity_factor * random.uniform(20, 70) * 0.6),
+            'pm10': max(0.0, random.uniform(20, 90) * 0.4 + intensity_factor * random.uniform(20, 90) * 0.6)
         }
 
     url = f"http://api.openweathermap.org/data/2.5/air_pollution?lat={lat}&lon={lon}&appid={self.openweather_api_key}"
@@ -127,14 +129,15 @@ def get_openweather_pollution(self, lat, lon):
         return None
 
 
-def get_waqi_pollution(self, lat, lon):
-    """Отримання даних про забруднення з WAQI API"""
+def get_waqi_pollution(self, lat, lon, road_count=1, highway_level=1):
+    """Отримання або генерація даних про забруднення з WAQI API"""
     if not self.waqi_api_key:
-        # Генеруємо тестові дані для демонстрації
+        intensity_factor = (road_count + 1) * (highway_level + 1)
+
         return {
-            'aqi': random.randint(0, 300),
-            'pm25': random.uniform(0, 75),
-            'pm10': random.uniform(0, 100)
+            'aqi': random.randint(50, 200),
+            'pm25': max(0.0, random.uniform(10, 50) + intensity_factor * random.uniform(0.2, 1.0)),
+            'pm10': max(0.0, random.uniform(20, 80) + intensity_factor * random.uniform(0.3, 1.2))
         }
 
     url = f"https://api.waqi.info/feed/geo:{lat};{lon}/?token={self.waqi_api_key}"
@@ -157,52 +160,78 @@ def get_waqi_pollution(self, lat, lon):
     return None
 
 
+
 def collect_pollution_data(self, num_points=20):
-        """Збір даних про забруднення для вибраних точок"""
-        print("Збір даних про забруднення повітря...")
-        if self.nodes is None:
-            print("Спочатку завантажте граф міста за допомогою get_city_graph()")
-            return
+    """Збір даних про забруднення повітря"""
+    print("Збір даних про забруднення повітря...")
+    if self.nodes is None:
+        print("Спочатку завантажте граф міста за допомогою get_city_graph()")
+        return
 
-        sample_nodes = self.sample_nodes(num_points)
-        pollution_data = []
+    sample_nodes = self.sample_nodes(num_points)
+    pollution_data = []
+    whatever = 0
+    print(f"whatever:{whatever}")
+    for idx, node in sample_nodes.iterrows():
+        lat, lon = node.geometry.y, node.geometry.x
+        road_count = len(self.graph.out_edges(idx))
 
-        for idx, node in sample_nodes.iterrows():
-            lat, lon = node.geometry.y, node.geometry.x
-            print(f"Обробка точки {lat}, {lon}")
+        # Отримуємо найвищий рівень дороги (якщо доступно)
+        edges = list(self.graph.out_edges(idx, data=True))
+        highway_level = 1  # default
+        for _, _, edge_data in edges:
+            hw_type = edge_data.get('highway')
+            if isinstance(hw_type, list):
+                hw_type = hw_type[0]
+            level = get_highway_level(hw_type)
+            if level > highway_level:
+                highway_level = level
 
-            # Отримуємо дані про забруднення з двох джерел
-            ow_data = get_openweather_pollution(self, lat, lon)
-            waqi_data = get_waqi_pollution(self, lat, lon)
+        ow_data = get_openweather_pollution(self, lat, lon, road_count, highway_level)
+        waqi_data = get_waqi_pollution(self, lat, lon, road_count, highway_level)
 
-            # Об'єднуємо дані
-            node_data = {
-                'node_id': idx,
-                'latitude': lat,
-                'longitude': lon,
-                'road_count': len(self.graph.out_edges(idx))
-            }
+        node_data = {
+            'node_id': idx,
+            'latitude': lat,
+            'longitude': lon,
+            'road_count': road_count,
+            'highway_level': highway_level
+        }
 
-            if ow_data:
-                node_data.update({
-                    'ow_aqi': ow_data['aqi'],
-                    'ow_co': ow_data['co'],
-                    'ow_no2': ow_data['no2'],
-                    'ow_pm2_5': ow_data['pm2_5'],
-                    'ow_pm10': ow_data['pm10']
-                })
+        if ow_data:
+            node_data.update({
+                'ow_aqi': ow_data['aqi'],
+                'ow_co': ow_data['co'],
+                'ow_no2': ow_data['no2'],
+                'ow_pm2_5': ow_data['pm2_5'],
+                'ow_pm10': ow_data['pm10']
+            })
 
-            if waqi_data:
-                node_data.update({
-                    'waqi_aqi': waqi_data['aqi'],
-                    'waqi_pm25': waqi_data['pm25'],
-                    'waqi_pm10': waqi_data['pm10']
-                })
+        if waqi_data:
+            node_data.update({
+                'waqi_aqi': waqi_data['aqi'],
+                'waqi_pm25': waqi_data['pm25'],
+                'waqi_pm10': waqi_data['pm10']
+            })
 
-            pollution_data.append(node_data)
-            # print(node_data)
-            # time.sleep(0.01)  # Пауза між запитами до API
+        pollution_data.append(node_data)
+        whatever += 1
+        print(f"whatever:{whatever}")
 
-        self.pollution_data = pd.DataFrame(pollution_data)
-        print(f"Зібрано дані про забруднення для {len(self.pollution_data)} точок.")
-        return self.pollution_data
+    self.pollution_data = pd.DataFrame(pollution_data)
+    print(f"Зібрано дані про забруднення для {len(self.pollution_data)} точок.")
+    return self.pollution_data
+
+def get_highway_level(highway_type):
+    """Повертає числовий рівень дороги за типом"""
+    levels = {
+        'motorway': 5,
+        'trunk': 4,
+        'primary': 3,
+        'secondary': 2,
+        'tertiary': 1,
+        'residential': 1,
+        'service': 0,
+        'unclassified': 0
+    }
+    return levels.get(str(highway_type), 0)

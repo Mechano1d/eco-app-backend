@@ -14,6 +14,9 @@ class pathfinding:
         weight = int(start_node['ow_aqi'].iloc[0]) + int(end_node['ow_aqi'].iloc[0]) / 2
         return weight
 
+    def pathfind_star(self, start, finish):
+        return
+
     def pathfind(self, start, finish):
         G = self.analyzer.graph
         path = nx.shortest_path(G, source=start, target=finish, weight=self.get_weight)
