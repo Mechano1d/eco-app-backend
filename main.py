@@ -338,6 +338,8 @@ async def calculate_route(city_name: str, data: RouteRequest):
         latlons = [(AnalysisApp.nodes.loc[node].geometry.y,
                     AnalysisApp.nodes.loc[node].geometry.x) for node in route]
         print(route)
+        route_star = pathfinder.pathfind_star(start, end)
+        print(route_star)
         return latlons
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
