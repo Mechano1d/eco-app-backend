@@ -1,4 +1,5 @@
 import base64
+import json
 from io import BytesIO
 import osmnx as ox
 import matplotlib.pyplot as plt
@@ -48,12 +49,25 @@ def get_db():
     finally:
         db.close()
 
+def load_api_keys(filepath='keys.json'):
+    try:
+        with open(filepath, 'r') as file:
+            keys = json.load(file)
+        return keys
+    except FileNotFoundError:
+        print(f"Файл {filepath} не знайдено.")
+        return {}
+    except json.JSONDecodeError:
+        print(f"Помилка розбору JSON у файлі {filepath}.")
+        return {}
+
 class RouteRequest(BaseModel):
     start: Tuple[float, float]
     end: Tuple[float, float]
 
 class TransportEcoAnalysis:
-    def __init__(self, city_name, openweather_api_key="73883df466fd45fd40e89c4da87d1d65", waqi_api_key=None, db=None):
+
+    def __init__(self, city_name, openweather_api_key=None, waqi_api_key=None, traffic_api_key=None, db=None):
         """
         Ініціалізація системи аналізу впливу транспорту на екологію
 
@@ -71,7 +85,7 @@ class TransportEcoAnalysis:
         self.waqi_api_key = waqi_api_key
         self.db = db
         self.engine = engine
-        self.traffic_api_key = "1hscno43lFy01NDffAXrTFOWL7NSXSb2"
+        self.traffic_api_key =traffic_api_key
         self.graph = None
         self.nodes = None
         self.edges = None
@@ -232,11 +246,13 @@ async def initialize_city(
     Ініціалізація аналізу для вказаного міста
     """
     try:
+        api_keys = load_api_keys()
         # Створюємо новий екземпляр аналізатора для міста
         AnalysisApp = TransportEcoAnalysis(
             city_name=city_name,
-            openweather_api_key=openweather_api_key,
-            waqi_api_key=waqi_api_key,
+            openweather_api_key=api_keys.get("openweathermap"),
+            waqi_api_key=api_keys.get("waqi"),
+            traffic_api_key=api_keys.get("traffic"),
             db=db
         )
 
